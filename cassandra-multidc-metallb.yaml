@@ -1,0 +1,99 @@
+---
+# ClientConfig tells the k8ssandra operator on sub-dc1 how to reach sub-dc2
+apiVersion: config.k8ssandra.io/v1beta1
+kind: ClientConfig
+metadata:
+  name: sub-dc2
+  namespace: k8ssandra-operator
+spec:
+  contextName: kind-sub-dc2
+  kubeConfigSecret:
+    name: sub-dc2-kubeconfig
+---
+# Per-node config for DC1: tells each Cassandra pod to broadcast its MetalLB IP
+# The ConfigMap key format is: <pod-name>_cassandra.yaml
+# cass-operator merges these values into cassandra.yaml at pod startup
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cassandra-dc1-per-node-config
+  namespace: k8ssandra-operator
+data:
+  # Pod cassandra-cluster-dc1-default-sts-0 gets MetalLB IP 172.19.255.1
+  cassandra-cluster-dc1-default-sts-0_cassandra.yaml: |
+    broadcast_address: 172.19.255.1
+    broadcast_rpc_address: 172.19.255.1
+---
+# Per-node config for DC2: same pattern, deployed to the dc2 cluster
+# MetalLB IP 172.19.255.11 is from the dc2-pool (172.19.255.11-20)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cassandra-dc2-per-node-config
+  namespace: k8ssandra-operator
+data:
+  # Pod cassandra-cluster-dc2-default-sts-0 gets MetalLB IP 172.19.255.11
+  cassandra-cluster-dc2-default-sts-0_cassandra.yaml: |
+    broadcast_address: 172.19.255.11
+    broadcast_rpc_address: 172.19.255.11
+---
+# K8ssandraCluster spanning both DCs using MetalLB IPs for cross-DC gossip
+apiVersion: k8ssandra.io/v1alpha1
+kind: K8ssandraCluster
+metadata:
+  name: cassandra-cluster
+  namespace: k8ssandra-operator
+spec:
+  cassandra:
+    serverVersion: "4.1.8"
+    storageConfig:
+      cassandraDataVolumeClaimSpec:
+        storageClassName: standard
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi
+    config:
+      jvmOptions:
+        heapSize: 512M
+    networking:
+      hostNetwork: false
+    # additionalSeeds is at the cassandra level (not per-DC).
+    # These are the MetalLB IPs of nodes in each DC, so cross-DC gossip
+    # uses the external MetalLB network instead of internal pod IPs.
+    additionalSeeds:
+      - "172.19.255.1"
+      - "172.19.255.11"
+    datacenters:
+      - metadata:
+          name: dc1
+        k8sContext: ""
+        size: 1
+        # perNodeConfigMapRef injects broadcast_address per pod.
+        # cass-operator's config-builder init container merges the ConfigMap
+        # entries into cassandra.yaml before Cassandra starts.
+        perNodeConfigMapRef:
+          name: cassandra-dc1-per-node-config
+        serviceAccount: cassandra-metallb
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: "1"
+            memory: 2Gi
+      - metadata:
+          name: dc2
+        k8sContext: kind-sub-dc2
+        size: 1
+        perNodeConfigMapRef:
+          name: cassandra-dc2-per-node-config
+        serviceAccount: cassandra-metallb
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: "1"
+            memory: 2Gi

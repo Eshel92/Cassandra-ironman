@@ -1,0 +1,39 @@
+---
+# Per-pod LoadBalancer service for DC1 Cassandra node 0
+# Applied to: kind-sub-dc1
+#
+# WHY: Each Cassandra pod needs its own externally-reachable IP so that
+# nodes in the other DC can gossip with it. MetalLB assigns an IP from
+# dc1-pool (172.19.255.1-10). The first service gets 172.19.255.1.
+#
+# PORTS:
+#   9042 - CQL native protocol (client connections)
+#   7000 - Internode gossip (how Cassandra nodes discover and sync with each other)
+#   8080 - Management API (used by cass-operator for health checks)
+apiVersion: v1
+kind: Service
+metadata:
+  name: cassandra-dc1-node-0-lb
+  namespace: k8ssandra-operator
+  labels:
+    app: cassandra-lb
+    datacenter: dc1
+spec:
+  type: LoadBalancer
+  selector:
+    cassandra.datastax.com/datacenter: dc1
+    cassandra.datastax.com/rack: default
+    statefulset.kubernetes.io/pod-name: cassandra-cluster-dc1-default-sts-0
+  ports:
+    - name: native
+      port: 9042
+      targetPort: 9042
+      protocol: TCP
+    - name: internode
+      port: 7000
+      targetPort: 7000
+      protocol: TCP
+    - name: mgmt-api
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

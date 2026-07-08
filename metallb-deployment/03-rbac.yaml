@@ -1,0 +1,37 @@
+---
+# ServiceAccount used by Cassandra pods.
+# Applied to: both clusters
+# This is needed because the K8ssandraCluster CR references it via serviceAccount.
+# It also enables future dynamic MetalLB IP discovery if using init containers.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cassandra-metallb
+  namespace: k8ssandra-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cassandra-metallb-svc-reader
+  namespace: k8ssandra-operator
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cassandra-metallb-svc-reader
+  namespace: k8ssandra-operator
+subjects:
+  - kind: ServiceAccount
+    name: cassandra-metallb
+    namespace: k8ssandra-operator
+roleRef:
+  kind: Role
+  name: cassandra-metallb-svc-reader
+  apiGroup: rbac.authorization.k8s.io

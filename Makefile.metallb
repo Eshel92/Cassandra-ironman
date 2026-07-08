@@ -1,0 +1,239 @@
+.PHONY: all create-clusters wait-ready metallb cert-manager k8ssandra \
+        cassandra-clientconfig cassandra-services cassandra status clean help
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+DC1      := sub-dc1
+DC2      := sub-dc2
+CTX1     := kind-sub-dc1
+CTX2     := kind-sub-dc2
+HELM     := helm
+KUBECTL  := kubectl
+KIND     := kind
+
+# MetalLB IP pools — must match metallb-pools manifests
+DC1_LB_IP := 172.19.255.1
+DC2_LB_IP := 172.19.255.11
+
+# ─── Default target ───────────────────────────────────────────────────────────
+all: create-clusters wait-ready metallb cert-manager k8ssandra cassandra-clientconfig cassandra-services cassandra
+	@echo ""
+	@echo "=== MetalLB multi-DC setup complete! ==="
+	@echo "DC1 CQL: cqlsh localhost 9042 -u cassandra-cluster-superuser -p <password>"
+	@echo "DC2 CQL: cqlsh localhost 9043 -u cassandra-cluster-superuser -p <password>"
+	@echo "Run 'make -f Makefile.metallb status' to check everything."
+	@echo "Run 'make -f Makefile.metallb get-creds' to get the superuser password."
+
+# ─── Phase 1: Create clusters with port mappings ─────────────────────────────
+create-clusters:
+	@echo ">>> Creating kind clusters with extraPortMappings..."
+	$(KIND) create cluster --name $(DC1) --config kind-metallb-dc1.yaml
+	$(KIND) create cluster --name $(DC2) --config kind-metallb-dc2.yaml
+	@echo ">>> Clusters created."
+
+# ─── Phase 2: Wait for nodes to be Ready ────────────────────────────────────
+wait-ready:
+	@echo ">>> Waiting for nodes to be Ready..."
+	$(KUBECTL) wait --for=condition=Ready node --all --context $(CTX1) --timeout=120s
+	$(KUBECTL) wait --for=condition=Ready node --all --context $(CTX2) --timeout=120s
+
+# ─── Phase 3: Deploy MetalLB ─────────────────────────────────────────────────
+metallb:
+	@echo ">>> Installing MetalLB on $(DC1)..."
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml --context $(CTX1)
+	@echo ">>> Installing MetalLB on $(DC2)..."
+	$(KUBECTL) apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml --context $(CTX2)
+	@echo ">>> Waiting for MetalLB controller to be ready..."
+	$(KUBECTL) rollout status deployment/controller -n metallb-system --context $(CTX1) --timeout=180s
+	$(KUBECTL) rollout status deployment/controller -n metallb-system --context $(CTX2) --timeout=180s
+	@echo ">>> Waiting for MetalLB speaker to be ready..."
+	$(KUBECTL) rollout status daemonset/speaker -n metallb-system --context $(CTX1) --timeout=120s
+	$(KUBECTL) rollout status daemonset/speaker -n metallb-system --context $(CTX2) --timeout=120s
+	@sleep 5
+	@echo ">>> Configuring MetalLB IP pools..."
+	@cat <<-'EOF' | $(KUBECTL) apply --context $(CTX1) -f -
+	apiVersion: metallb.io/v1beta1
+	kind: IPAddressPool
+	metadata:
+	  name: dc1-pool
+	  namespace: metallb-system
+	spec:
+	  addresses:
+	    - 172.19.255.1-172.19.255.10
+	---
+	apiVersion: metallb.io/v1beta1
+	kind: L2Advertisement
+	metadata:
+	  name: dc1-l2
+	  namespace: metallb-system
+	spec:
+	  ipAddressPools:
+	    - dc1-pool
+	EOF
+	@cat <<-'EOF' | $(KUBECTL) apply --context $(CTX2) -f -
+	apiVersion: metallb.io/v1beta1
+	kind: IPAddressPool
+	metadata:
+	  name: dc2-pool
+	  namespace: metallb-system
+	spec:
+	  addresses:
+	    - 172.19.255.11-172.19.255.20
+	---
+	apiVersion: metallb.io/v1beta1
+	kind: L2Advertisement
+	metadata:
+	  name: dc2-l2
+	  namespace: metallb-system
+	spec:
+	  ipAddressPools:
+	    - dc2-pool
+	EOF
+	@echo ">>> MetalLB configured."
+
+# ─── Phase 4: Install cert-manager ───────────────────────────────────────────
+cert-manager:
+	@echo ">>> Installing cert-manager on both clusters..."
+	$(HELM) repo add jetstack https://charts.jetstack.io 2>/dev/null || true
+	$(HELM) repo update jetstack
+	$(HELM) install cert-manager jetstack/cert-manager \
+		--kube-context $(CTX1) \
+		--namespace cert-manager --create-namespace \
+		--set crds.enabled=true
+	$(HELM) install cert-manager jetstack/cert-manager \
+		--kube-context $(CTX2) \
+		--namespace cert-manager --create-namespace \
+		--set crds.enabled=true
+	$(KUBECTL) rollout status deployment/cert-manager -n cert-manager --context $(CTX1) --timeout=120s
+	$(KUBECTL) rollout status deployment/cert-manager -n cert-manager --context $(CTX2) --timeout=120s
+
+# ─── Phase 5: Install k8ssandra operator ──────────────────────────────────────
+k8ssandra:
+	@echo ">>> Installing k8ssandra-operator on both clusters..."
+	$(HELM) repo add k8ssandra https://helm.k8ssandra.io/stable 2>/dev/null || true
+	$(HELM) repo update k8ssandra
+	$(HELM) install k8ssandra-operator k8ssandra/k8ssandra-operator \
+		--kube-context $(CTX1) \
+		--namespace k8ssandra-operator --create-namespace
+	$(HELM) install k8ssandra-operator k8ssandra/k8ssandra-operator \
+		--kube-context $(CTX2) \
+		--namespace k8ssandra-operator --create-namespace
+	$(KUBECTL) rollout status deployment/k8ssandra-operator -n k8ssandra-operator --context $(CTX1) --timeout=180s
+	$(KUBECTL) rollout status deployment/k8ssandra-operator -n k8ssandra-operator --context $(CTX2) --timeout=180s
+
+# ─── Phase 6: Create ClientConfig for cross-cluster access ───────────────────
+cassandra-clientconfig:
+	@echo ">>> Creating RBAC for MetalLB service discovery..."
+	$(KUBECTL) apply -f metallb-rbac.yaml --context $(CTX1)
+	$(KUBECTL) apply -f metallb-rbac.yaml --context $(CTX2)
+	@echo ">>> Creating kubeconfig secret for $(DC2) on $(DC1)..."
+	@DC2_CA=$$($(KUBECTL) config view --raw -o jsonpath='{.clusters[?(@.name=="$(CTX2)")].cluster.certificate-authority-data}') && \
+	DC2_CERT=$$($(KUBECTL) config view --raw -o jsonpath='{.users[?(@.name=="$(CTX2)")].user.client-certificate-data}') && \
+	DC2_KEY=$$($(KUBECTL) config view --raw -o jsonpath='{.users[?(@.name=="$(CTX2)")].user.client-key-data}') && \
+	DC2_IP=$$(docker inspect $(DC2)-control-plane --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}') && \
+	cat > /tmp/dc2-kubeconfig.yaml <<KUBECONFIG && \
+	apiVersion: v1 \
+	kind: Config \
+	clusters: \
+	- cluster: \
+	    certificate-authority-data: $${DC2_CA} \
+	    server: https://$${DC2_IP}:6443 \
+	  name: $(CTX2) \
+	contexts: \
+	- context: \
+	    cluster: $(CTX2) \
+	    user: $(CTX2) \
+	  name: $(CTX2) \
+	current-context: $(CTX2) \
+	users: \
+	- name: $(CTX2) \
+	  user: \
+	    client-certificate-data: $${DC2_CERT} \
+	    client-key-data: $${DC2_KEY} \
+	KUBECONFIG
+	$(KUBECTL) create secret generic sub-dc2-kubeconfig \
+		--from-file=kubeconfig=/tmp/dc2-kubeconfig.yaml \
+		-n k8ssandra-operator --context $(CTX1) && \
+	rm -f /tmp/dc2-kubeconfig.yaml
+
+# ─── Phase 7: Create MetalLB + NodePort services ─────────────────────────────
+cassandra-services:
+	@echo ">>> Creating per-pod LoadBalancer services (MetalLB assigns IPs)..."
+	$(KUBECTL) apply -f metallb-services-dc1.yaml --context $(CTX1)
+	$(KUBECTL) apply -f metallb-services-dc2.yaml --context $(CTX2)
+	@echo ">>> Creating NodePort services for host access..."
+	$(KUBECTL) apply -f metallb-nodeport-dc1.yaml --context $(CTX1)
+	$(KUBECTL) apply -f metallb-nodeport-dc2.yaml --context $(CTX2)
+	@echo ">>> Waiting for MetalLB IP assignment..."
+	@sleep 3
+	@echo "DC1 MetalLB IP: $$($(KUBECTL) --context $(CTX1) get svc cassandra-dc1-node-0-lb -n k8ssandra-operator -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+	@echo "DC2 MetalLB IP: $$($(KUBECTL) --context $(CTX2) get svc cassandra-dc2-node-0-lb -n k8ssandra-operator -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+
+# ─── Phase 8: Deploy Cassandra Multi-DC ───────────────────────────────────────
+cassandra:
+	@echo ">>> Deploying Cassandra multi-DC cluster with MetalLB broadcast addresses..."
+	$(KUBECTL) apply -f cassandra-multidc-metallb.yaml --context $(CTX1)
+	@echo ">>> Cassandra is deploying (takes 5-10 min). Watch with:"
+	@echo "    kubectl get pods -n k8ssandra-operator -w --context $(CTX1)"
+	@echo "    kubectl get pods -n k8ssandra-operator -w --context $(CTX2)"
+
+# ─── Status ───────────────────────────────────────────────────────────────────
+status:
+	@echo "=== Nodes ==="
+	@$(KUBECTL) get nodes --context $(CTX1)
+	@$(KUBECTL) get nodes --context $(CTX2)
+	@echo ""
+	@echo "=== MetalLB Services ==="
+	@$(KUBECTL) get svc -n k8ssandra-operator --context $(CTX1) -l app=cassandra-lb 2>/dev/null || true
+	@$(KUBECTL) get svc -n k8ssandra-operator --context $(CTX2) -l app=cassandra-lb 2>/dev/null || true
+	@echo ""
+	@echo "=== Cassandra pods (dc1) ==="
+	@$(KUBECTL) get pods -n k8ssandra-operator --context $(CTX1) 2>/dev/null || echo "(not deployed yet)"
+	@echo ""
+	@echo "=== Cassandra pods (dc2) ==="
+	@$(KUBECTL) get pods -n k8ssandra-operator --context $(CTX2) 2>/dev/null || echo "(not deployed yet)"
+	@echo ""
+	@echo "=== Cassandra nodetool status ==="
+	@$(KUBECTL) exec cassandra-cluster-dc1-default-sts-0 -c cassandra \
+		-n k8ssandra-operator --context $(CTX1) -- nodetool status 2>/dev/null \
+		|| echo "(cassandra not ready yet)"
+
+# ─── Get credentials ──────────────────────────────────────────────────────────
+get-creds:
+	@echo "=== Cassandra superuser credentials ==="
+	@echo -n "Username: " && $(KUBECTL) --context $(CTX1) get secret cassandra-cluster-superuser \
+		-n k8ssandra-operator -o jsonpath='{.data.username}' | base64 -d && echo ""
+	@echo -n "Password: " && $(KUBECTL) --context $(CTX1) get secret cassandra-cluster-superuser \
+		-n k8ssandra-operator -o jsonpath='{.data.password}' | base64 -d && echo ""
+	@echo ""
+	@echo "DC1: cqlsh localhost 9042 -u <username> -p <password>"
+	@echo "DC2: cqlsh localhost 9043 -u <username> -p <password>"
+
+# ─── Clean ────────────────────────────────────────────────────────────────────
+clean:
+	@echo ">>> Deleting clusters..."
+	$(KIND) delete cluster --name $(DC1) || true
+	$(KIND) delete cluster --name $(DC2) || true
+	@echo ">>> Done."
+
+help:
+	@echo ""
+	@echo "Cassandra Multi-DC on Kind + MetalLB"
+	@echo ""
+	@echo "Usage: make -f Makefile.metallb <target>"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all                 Full setup from scratch"
+	@echo "  create-clusters     Create kind clusters with port mappings"
+	@echo "  metallb             Install and configure MetalLB"
+	@echo "  cert-manager        Install cert-manager"
+	@echo "  k8ssandra           Install k8ssandra-operator"
+	@echo "  cassandra-services  Create LB + NodePort services"
+	@echo "  cassandra           Deploy Cassandra multi-DC"
+	@echo "  status              Show cluster status"
+	@echo "  get-creds           Show Cassandra superuser credentials"
+	@echo "  clean               Delete clusters"
+	@echo ""
+	@echo "Access:"
+	@echo "  DC1: cqlsh localhost 9042"
+	@echo "  DC2: cqlsh localhost 9043"
+	@echo ""

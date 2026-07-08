@@ -1,0 +1,18 @@
+---
+# NodePort service for host access to dc1 Cassandra via localhost:9042
+# kind extraPortMappings maps hostPort 9042 -> containerPort 30042 (this NodePort)
+apiVersion: v1
+kind: Service
+metadata:
+  name: cassandra-dc1-nodeport
+  namespace: k8ssandra-operator
+spec:
+  type: NodePort
+  selector:
+    cassandra.datastax.com/datacenter: dc1
+  ports:
+    - name: native
+      port: 9042
+      targetPort: 9042
+      nodePort: 30042
+      protocol: TCP

@@ -1,0 +1,35 @@
+---
+# ServiceAccount for Cassandra pods to query their LoadBalancer service IP
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cassandra-metallb
+  namespace: k8ssandra-operator
+---
+# Role allowing pods to read Services in the namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cassandra-metallb-svc-reader
+  namespace: k8ssandra-operator
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cassandra-metallb-svc-reader
+  namespace: k8ssandra-operator
+subjects:
+  - kind: ServiceAccount
+    name: cassandra-metallb
+    namespace: k8ssandra-operator
+roleRef:
+  kind: Role
+  name: cassandra-metallb-svc-reader
+  apiGroup: rbac.authorization.k8s.io
